@@ -1,0 +1,21 @@
+{
+  "source": "C:/path/to/original_wafer_dataset",
+  "output": "C:/path/to/prepared_wafer_dataset",
+  "images_dir": null,
+  "labels_dir": null,
+  "data_yaml": null,
+  "names": null,
+  "classes": null,
+  "split_mode": "random",
+  "group_csv": null,
+  "split_manifest": null,
+  "val_fraction": 0.2,
+  "test_fraction": 0.1,
+  "seed": 42,
+  "tile_size": 640,
+  "overlap": 0.25,
+  "tile_label_mode": "conservative",
+  "min_bbox_px": 1.0,
+  "negative_tile_keep_prob": 0.25,
+  "missing_is_normal": false
+}

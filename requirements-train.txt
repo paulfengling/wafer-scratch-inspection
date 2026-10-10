@@ -1,0 +1,5 @@
+# Use a separate training environment: Ultralytics requires opencv-python.
+# Installing both OpenCV wheels into one environment can conflict.
+numpy==2.1.3
+opencv-python==4.10.0.84
+ultralytics>=8.3.0,<9.0.0

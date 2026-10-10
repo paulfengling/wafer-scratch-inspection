@@ -1,0 +1,15 @@
+.venv/
+.venv-train/
+venv/
+__pycache__/
+*.pyc
+outputs/
+synthetic_demo/
+datasets/
+runs/
+dist/
+*.pt
+*.onnx
+*.engine
+.env
+.env.*

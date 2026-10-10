@@ -1,0 +1,10 @@
+{
+  "min_arc_deg": 30.0,
+  "max_center_offset_px": 48.0,
+  "angular_step_deg": 0.5,
+  "radial_tolerance_px": 2.5,
+  "max_radial_residual_px": 2.0,
+  "max_gap_deg": 2.0,
+  "min_arc_coverage": 0.72,
+  "edge_margin_px": 8.0
+}
