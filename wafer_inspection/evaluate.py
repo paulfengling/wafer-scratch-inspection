@@ -1,6 +1,7 @@
 """Evaluate wafer-level decisions against complete YOLO detect labels.
 
-Usage: python -m wafer_inspection.evaluate --run outputs/run01 --labels labels/test
+Usage: python evaluate.py [--run outputs/run01] [--labels labels/test]
+       python -m wafer_inspection.evaluate --run outputs/run01 --labels labels/test
 Use --circle-id and --line-id when model.names cannot identify the class mapping.
 Empty label files represent noncritical wafers; absent labels are errors unless
 --missing-is-normal is explicitly supplied. A label root must mirror the input
@@ -116,31 +117,58 @@ def evaluate(run: Path, labels: Path, circle_id: int, line_id: int,
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--run', type=Path, required=True)
-    parser.add_argument('--labels', type=Path, required=True)
-    parser.add_argument('--circle-id', type=int)
-    parser.add_argument('--line-id', type=int)
-    parser.add_argument('--missing-is-normal', action='store_true')
-    args = parser.parse_args()
+def build_parser() -> argparse.ArgumentParser:
+    """Build argument parser for both direct and module invocation."""
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--run', type=Path, required=True,
+                        help='Path to the pipeline output directory (contains summary.json)')
+    parser.add_argument('--labels', type=Path, required=True,
+                        help='Path to the ground truth labels directory')
+    parser.add_argument('--circle-id', type=int, default=None,
+                        help='Class ID for circle scratch (auto-detect if not provided)')
+    parser.add_argument('--line-id', type=int, default=None,
+                        help='Class ID for line scratch (auto-detect if not provided)')
+    parser.add_argument('--missing-is-normal', action='store_true',
+                        help='Treat missing label files as noncritical wafers')
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Main entry point supporting both direct execution and module invocation."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
     try:
+        if not args.run.exists():
+            raise FileNotFoundError(f"Run directory not found: {args.run}")
+        if not args.labels.exists():
+            raise FileNotFoundError(f"Labels directory not found: {args.labels}")
+
         summary = json.loads((args.run / 'summary.json').read_text(encoding='utf-8'))
         names = {int(k): v.lower().replace(' ', '').replace('_', '').replace('-', '')
                  for k, v in summary.get('model_names', {}).items()}
-        def find_id(name, explicit):
+
+        def find_id(name: str, explicit: int | None) -> int:
             if explicit is not None:
                 return explicit
             matches = [key for key, value in names.items() if value == name]
             if len(matches) != 1:
                 raise ValueError(f'Cannot uniquely resolve {name}; supply --circle-id and --line-id')
             return matches[0]
-        result = evaluate(args.run, args.labels, find_id('circlescratch', args.circle_id),
-                          find_id('linescratch', args.line_id), args.missing_is_normal)
+
+        result = evaluate(args.run, args.labels,
+                          find_id('circlescratch', args.circle_id),
+                          find_id('linescratch', args.line_id),
+                          args.missing_is_normal)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        parser.exit(2, f'Evaluation error: {exc}\n')
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(f'Evaluation error: {exc}', flush=True)
+        return 2
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
