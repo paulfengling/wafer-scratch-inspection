@@ -338,15 +338,20 @@ def _check_detections(detections: list[YoloDetection], names: dict[int, str]) ->
 
 def make_overlay(image: np.ndarray, hits: list[Any], detections: list[YoloDetection]) -> np.ndarray:
     canvas = image.copy()
-    for i, hit in enumerate(hits, start=1):
+    yellow = (0, 255, 255)
+    height, width = canvas.shape[:2]
+    for hit in hits:
         center = (int(round(hit.cx)), int(round(hit.cy)))
         radius = max(1, int(round(hit.radius)))
-        cv2.ellipse(canvas, center, (radius, radius), 0, hit.start_angle_deg, hit.start_angle_deg + hit.arc_span_deg, (0, 220, 255), 2)
-        cv2.drawMarker(canvas, center, (0, 220, 255), cv2.MARKER_CROSS, 12, 1)
-        x1, y1, x2, y2 = map(lambda n: int(round(n)), hit.bbox)
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 220, 255), 1)
-        label = f"rule circle {i}: {hit.arc_span_deg:.1f} deg"
-        cv2.putText(canvas, label, (max(0, x1), max(18, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1, cv2.LINE_AA)
+        cv2.ellipse(canvas, center, (radius, radius), 0, hit.start_angle_deg,
+                    hit.start_angle_deg + hit.arc_span_deg, yellow, 2, cv2.LINE_AA)
+        x1, y1 = (int(round(n)) for n in hit.bbox[:2])
+        label = "circle scratch"
+        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        label_x = max(0, min(x1, width - text_width - 1))
+        label_y = min(height - baseline - 1, max(text_height + 1, y1 - 5))
+        cv2.putText(canvas, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48, yellow, 1, cv2.LINE_AA)
     for detection in detections:
         x1, y1, x2, y2 = map(lambda n: int(round(n)), detection.bbox)
         cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 90, 255), 2)
@@ -365,7 +370,8 @@ def _save_artifacts(config: PipelineConfig, relative: Path, bucket: str, path: P
     artifact_paths: dict[str, Any] = {"image": str(original.relative_to(config.output))}
     if image is not None:
         overlay = root / "overlays" / relative.parent / (relative.name + ".png")
-        write_png(overlay, make_overlay(image, hits, detections))
+        overlay_detections = [] if bucket == "rule-based" else detections
+        write_png(overlay, make_overlay(image, hits, overlay_detections))
         artifact_paths["overlay"] = str(overlay.relative_to(config.output))
         if hits:
             height, width = image.shape[:2]

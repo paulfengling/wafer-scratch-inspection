@@ -166,7 +166,7 @@ Windows 示例使用 `--workers 0` 避免 DataLoader 子进程问题。CPU 可�
 | yolo-pending | 无权重时规则阴性，等待 YOLO 检测 |
 | errors | 读取／处理异常，需复核 |
 
-结果提供原图和 JSON records，成功读取的图片有 overlay；规则命中的圆划痕另外生成 crops，YOLO 框当前在 overlay／records 中保存。读取失败无法生成 overlay。`summary.json` 汇总路由。输出必须为新目录。无需 YOLO 时不传 `--weights`，但阴性图片进入 pending，不能视为正常。
+结果提供原图和 JSON records，成功读取的图片有 overlay；rule-based 结果图只用黄色线沿检测圆弧绘制，并标注 `circle scratch`，另外生成原图 crops。YOLO 检测框保存在 records，并在 YOLO 结果图上绘制。读取失败无法生成 overlay。`summary.json` 汇总路由。输出必须为新目录。无需 YOLO 时不传 `--weights`，但阴性图片进入 pending，不能视为正常。
 
 默认命中 circle 的图片直接跳过 YOLO，符合“先规则、后模型”的报废筛选流程。因此同一图的 line scratch 可能不单独记录。若需要完整分类统计，增加 `--yolo-on-rule-hit`。
 
