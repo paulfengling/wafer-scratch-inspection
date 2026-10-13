@@ -6,5 +6,10 @@
   "max_radial_residual_px": 2.0,
   "max_gap_deg": 2.0,
   "min_arc_coverage": 0.72,
-  "edge_margin_px": 8.0
+  "edge_margin_px": 8.0,
+  "min_gray_difference": 25.0,
+  "gray_background_offset_px": 6.0,
+  "gray_background_width_px": 3.0,
+  "merge_center_tolerance_px": 8.0,
+  "merge_radius_tolerance_px": 5.0
 }

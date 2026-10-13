@@ -6,13 +6,13 @@ import cv2
 import numpy as np
 
 
-def scene(arcs=(), lines=(), dots=False, seed=17):
+def scene(arcs=(), lines=(), dots=False, seed=17, background_level=40):
     rng = np.random.default_rng(seed)
     size = 1096
     yy, xx = np.mgrid[:size, :size]
     wafer = (xx - 548) ** 2 + (yy - 548) ** 2 <= 515 ** 2
     # Slight shading and sensor noise, with a visible circular wafer boundary.
-    background = 40 + 3 * (xx - 548) / 515 + rng.normal(0, 1.3, (size, size))
+    background = background_level + 3 * (xx - 548) / 515 + rng.normal(0, 1.3, (size, size))
     gray = np.where(wafer, background, 5).clip(0, 255).astype(np.uint8)
     for cx, cy, radius, start, span, intensity, width in arcs:
         cv2.ellipse(gray, (cx, cy), (radius, radius), 0, start, start + span,
@@ -37,7 +37,7 @@ def cases():
         ("wrap40", scene([(572, 530, 320, 350, 40, 130, 3)]),
          [(572, 530, 320)], True),
         ("weak45", scene([(566, 535, 280, 185, 45, 60, 2)]),
-         [(566, 535, 280)], True),
+         [], False),
         ("two_radii", scene([(572, 530, 150, 0, 360, 130, 2),
                               (572, 530, 300, 120, 80, 130, 2)]),
          [(572, 530, 150), (572, 530, 300)], True),

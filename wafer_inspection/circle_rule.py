@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import math
 import time
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -39,6 +39,11 @@ class RuleConfig:
     min_contrast: float = 6.0
     threshold_mad_multiplier: float = 4.0
     brightness_threshold: float | None = None
+    min_gray_difference: float = 25.0
+    gray_background_offset_px: float = 6.0
+    gray_background_width_px: float = 3.0
+    merge_center_tolerance_px: float = 8.0
+    merge_radius_tolerance_px: float = 5.0
     top_hat_sizes: tuple[int, ...] = (9, 17, 31)
     center_grid_step_px: float = 16.0
     max_components: int = 128
@@ -52,7 +57,8 @@ class RuleConfig:
     def validate(self) -> None:
         positive = ("min_radius_px", "angular_step_deg", "radial_tolerance_px",
                     "max_radial_residual_px", "min_support_pixels", "min_contrast",
-                    "center_grid_step_px", "tensor_sigma_px")
+                    "center_grid_step_px", "tensor_sigma_px",
+                    "gray_background_offset_px", "gray_background_width_px")
         for name in positive:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
@@ -69,10 +75,14 @@ class RuleConfig:
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be in [0, 1]")
         for name in ("max_center_offset_px", "edge_margin_px", "max_gap_deg",
-                     "threshold_mad_multiplier", "min_line_residual_px"):
+                     "threshold_mad_multiplier", "min_line_residual_px",
+                     "min_gray_difference", "merge_center_tolerance_px",
+                     "merge_radius_tolerance_px"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        if self.min_gray_difference > 255:
+            raise ValueError("min_gray_difference must be in [0, 255]")
         if self.angular_step_deg > 5 or self.max_gap_deg >= self.min_arc_deg:
             raise ValueError("angular_step_deg must be <= 5 and max_gap_deg < min_arc_deg")
         for name in ("max_components", "max_grid_candidates",
@@ -370,11 +380,42 @@ def _ridge_radii(samples: np.ndarray, radii: np.ndarray) -> np.ndarray:
             np.maximum(weight_sum, 1e-6))
 
 
+def _gray_contrast(gray: np.ndarray, mask: np.ndarray, center: tuple[float, float],
+                   ridge_radii: np.ndarray, cosines: np.ndarray, sines: np.ndarray,
+                   config: RuleConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Original ridge gray minus the local wafer median on both radial sides.
+
+    Background bands stay outside the radial support strip. Samples outside the
+    usable wafer never become background; at least one full band's worth of
+    valid samples is required, including when the other side approaches an edge.
+    """
+    offset = max(config.gray_background_offset_px, config.radial_tolerance_px + 1.0)
+    side_offsets = offset + np.arange(math.ceil(config.gray_background_width_px), dtype=np.float32)
+    offsets = np.concatenate((-side_offsets, side_offsets))
+    sample_radii = np.vstack((ridge_radii, ridge_radii[None, :] + offsets[:, None]))
+    xmap = (center[0] + sample_radii * cosines[None, :]).astype(np.float32)
+    ymap = (center[1] + sample_radii * sines[None, :]).astype(np.float32)
+    samples = cv2.remap(gray, xmap, ymap, cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT).astype(np.float32)
+    valid = (cv2.remap(mask, xmap, ymap, cv2.INTER_NEAREST,
+                       borderMode=cv2.BORDER_CONSTANT) > 0) & (sample_radii > 0)
+    count = valid[1:].sum(axis=0)
+    ordered = np.sort(np.where(valid[1:], samples[1:], np.inf), axis=0)
+    columns = np.arange(len(ridge_radii))
+    lower = np.maximum(0, (count - 1) // 2)
+    upper = count // 2
+    wafer_gray = (ordered[lower, columns] + ordered[upper, columns]) * 0.5
+    usable = valid[0] & (count >= len(side_offsets))
+    difference = np.where(usable, samples[0] - wafer_gray, -np.inf)
+    return samples[0], wafer_gray, difference
+
+
 def _verify_candidate(response: np.ndarray, mask: np.ndarray, wafer: dict[str, Any],
                       candidate: tuple[float, float, float], config: RuleConfig,
                       threshold: float, maximum_radius: float, cosines: np.ndarray,
                       sines: np.ndarray, angular_step: float, source: str,
-                      tensors: tuple[np.ndarray, np.ndarray, np.ndarray]) -> list[CircleHit]:
+                      tensors: tuple[np.ndarray, np.ndarray, np.ndarray],
+                      gray: np.ndarray) -> list[CircleHit]:
     cx, cy, radius = candidate
     tolerance = config.radial_tolerance_px
     # Subpixel radial sampling finds the ridge across the estimated circle, then
@@ -386,7 +427,11 @@ def _verify_candidate(response: np.ndarray, mask: np.ndarray, wafer: dict[str, A
     best_index = samples.argmax(axis=0)
     best_values = samples[best_index, np.arange(samples.shape[1])]
     ridge_radii = _ridge_radii(samples, radii)
+    _, _, gray_difference = _gray_contrast(gray, mask, (cx, cy), ridge_radii,
+                                           cosines, sines, config)
     support = best_values >= threshold
+    if config.min_gray_difference > 0:
+        support &= gray_difference >= config.min_gray_difference
     gap_bins = int(math.floor(config.max_gap_deg / angular_step + 1e-6))
     initial_runs = _circular_runs(support, gap_bins)
     hits: list[CircleHit] = []
@@ -421,7 +466,11 @@ def _verify_candidate(response: np.ndarray, mask: np.ndarray, wafer: dict[str, A
         final_index = final_samples.argmax(axis=0)
         final_values = final_samples[final_index, np.arange(final_samples.shape[1])]
         final_ridge_radii = _ridge_radii(final_samples, check_radii)
+        scratch_gray, wafer_gray, final_gray_difference = _gray_contrast(
+            gray, mask, (fx, fy), final_ridge_radii, cosines, sines, config)
         final_support = final_values >= threshold
+        if config.min_gray_difference > 0:
+            final_support &= final_gray_difference >= config.min_gray_difference
         for final_start, final_length, coverage in _circular_runs(final_support, gap_bins):
             span = min(360.0, final_length * angular_step)
             if span + 1e-6 < config.min_arc_deg or coverage < config.min_arc_coverage:
@@ -472,6 +521,11 @@ def _verify_candidate(response: np.ndarray, mask: np.ndarray, wafer: dict[str, A
                     min(w, int(math.ceil(xs.max())) + padding + 1),
                     min(h, int(math.ceil(ys.max())) + padding + 1))
             strength = float(np.median(final_values[evidence_indices]))
+            gray_indices = evidence_indices[np.isfinite(final_gray_difference[evidence_indices])]
+            gray_diagnostics = {name: float(np.median(values[gray_indices])) if len(gray_indices) else None
+                                for name, values in (("median_scratch_gray", scratch_gray),
+                                                     ("median_wafer_gray", wafer_gray),
+                                                     ("median_gray_difference", final_gray_difference))}
             score = coverage * math.exp(-arc_residual / max(tolerance, 1)) * min(1.0, strength / (threshold * 2))
             hits.append(CircleHit(fx, fy, fr, final_start * angular_step, span, coverage,
                                   support_pixels, arc_residual, bbox, float(score),
@@ -481,17 +535,11 @@ def _verify_candidate(response: np.ndarray, mask: np.ndarray, wafer: dict[str, A
                                    "line_residual_px": line_residual, "circle_line_gain": line_gain,
                                    "tangent_consistency": tangent_consistency,
                                    "median_tangent_alignment": float(np.median(alignment)),
+                                   **gray_diagnostics,
+                                   "min_gray_difference": config.min_gray_difference,
                                    "max_gap_deg": config.max_gap_deg},
                                   _evidence_points=evidence_points))
     return hits
-
-
-def _angle_overlap(a: CircleHit, b: CircleHit) -> float:
-    # Rasterizing at one degree is sufficient for duplicate suppression only.
-    angles = np.arange(360, dtype=float)
-    am = ((angles - a.start_angle_deg) % 360) < a.arc_span_deg
-    bm = ((angles - b.start_angle_deg) % 360) < b.arc_span_deg
-    return float(np.count_nonzero(am & bm) / max(1, min(np.count_nonzero(am), np.count_nonzero(bm))))
 
 
 def _spatial_arc_overlap(hit: CircleHit, old: CircleHit, tolerance: float) -> float:
@@ -512,6 +560,131 @@ def _spatial_arc_overlap(hit: CircleHit, old: CircleHit, tolerance: float) -> fl
     relative_angles = (np.rad2deg(np.arctan2(y, x)) - old.start_angle_deg) % 360
     on_old_arc = relative_angles < old.arc_span_deg + 1e-6
     return float(np.mean(near_radius & on_old_arc))
+
+
+def _arc_interval(hit: CircleHit, center: tuple[float, float]) -> tuple[float, float]:
+    """Project the whole arc interval into a common center's angular frame."""
+    if hit.arc_span_deg >= 360 - 1e-6:
+        return 0.0, 360.0
+    angles = np.deg2rad(hit.start_angle_deg + np.linspace(
+        0, hit.arc_span_deg, max(2, int(math.ceil(hit.arc_span_deg / 5)) + 1)))
+    x = hit.cx + hit.radius * np.cos(angles) - center[0]
+    y = hit.cy + hit.radius * np.sin(angles) - center[1]
+    projected = np.rad2deg(np.unwrap(np.arctan2(y, x)))
+    start = float(projected[0] % 360)
+    return start, start + float(projected[-1] - projected[0])
+
+
+def _arc_gap(a: CircleHit, b: CircleHit) -> float:
+    a_start, a_end = _arc_interval(a, (a.cx, a.cy))
+    b_start, b_end = _arc_interval(b, (a.cx, a.cy))
+    return min(max(0.0, max(a_start, b_start + shift) - min(a_end, b_end + shift))
+               for shift in (-360, 0, 360))
+
+
+def _arc_is_contained(hit: CircleHit, old: CircleHit, angular_tolerance: float) -> bool:
+    """Duplicate removal may discard a contained fit, but never a long new tail."""
+    if old.arc_span_deg >= 360 - 1e-6:
+        return True
+    if hit._evidence_points is not None and len(hit._evidence_points) > 1:
+        delta = hit._evidence_points - np.array([old.cx, old.cy])
+        angles = np.sort(np.rad2deg(np.arctan2(delta[:, 1], delta[:, 0])) % 360)
+        gaps = np.diff(np.concatenate((angles, angles[:1] + 360)))
+        gap_index = int(np.argmax(gaps))
+        start = float(angles[(gap_index + 1) % len(angles)])
+        end = start + 360 - float(gaps[gap_index])
+    else:
+        start, end = _arc_interval(hit, (old.cx, old.cy))
+    return any(start + shift >= old.start_angle_deg - angular_tolerance and
+               end + shift <= old.start_angle_deg + old.arc_span_deg + angular_tolerance
+               for shift in (-360, 0, 360))
+
+
+def _evidence_arc_overlap(hit: CircleHit, old: CircleHit, tolerance: float) -> float:
+    """Compare actual ridge points when a common circle approximates two arcs."""
+    if (hit._evidence_points is None or old._evidence_points is None or
+            not len(hit._evidence_points) or not len(old._evidence_points)):
+        return 0.0
+    near_count = 0
+    old_points = old._evidence_points
+    for start in range(0, len(hit._evidence_points), 128):
+        points = hit._evidence_points[start:start + 128]
+        squared_distance = ((points[:, None, 0] - old_points[None, :, 0]) ** 2 +
+                            (points[:, None, 1] - old_points[None, :, 1]) ** 2)
+        near_count += int(np.count_nonzero(squared_distance.min(axis=1) <= tolerance ** 2))
+    return near_count / len(hit._evidence_points)
+
+
+def _merge_overlapping_hits(hits: list[CircleHit], config: RuleConfig,
+                            reverify: Callable[[float, float, float], list[CircleHit]]) -> tuple[list[CircleHit], int]:
+    """Fit and reverify unions before duplicate suppression can discard tails.
+
+    Each pair of original members must remain within the configured geometry
+    tolerances, preventing a chain of nearby centers from drifting arbitrarily.
+    Failed unions keep the independently verified arcs.
+    """
+    groups: list[tuple[CircleHit, list[CircleHit]]] = []
+    merge_count = 0
+    spatial_tolerance = max(config.radial_tolerance_px, config.max_radial_residual_px)
+
+    def compatible(a: CircleHit, b: CircleHit) -> bool:
+        return (math.hypot(a.cx - b.cx, a.cy - b.cy) <= config.merge_center_tolerance_px and
+                abs(a.radius - b.radius) <= config.merge_radius_tolerance_px)
+
+    for hit in hits:
+        current, members = hit, [hit]
+        index = 0
+        while index < len(groups):
+            old, old_members = groups[index]
+            if (not all(compatible(a, b) for a in members for b in old_members) or
+                    _arc_gap(current, old) > config.max_gap_deg + 1e-6):
+                index += 1
+                continue
+            # Fully contained duplicate evidence cannot extend this arc. Leave
+            # it for the inexpensive duplicate suppression below.
+            if _spatial_arc_overlap(current, old, spatial_tolerance) >= 0.98:
+                index += 1
+                continue
+            joint_members = old_members + members
+            evidence = [member._evidence_points for member in joint_members]
+            if any(points is None for points in evidence):
+                index += 1
+                continue
+            points = np.unique(np.round(np.concatenate(evidence), 3), axis=0)
+            fitted = _fit_circle(points)
+            if fitted is None:
+                index += 1
+                continue
+            cx, cy, radius, residual = fitted
+            if config.max_center_offset_px == 0 and config.wafer_center is not None:
+                cx, cy = config.wafer_center
+                point_radii = np.linalg.norm(points - np.array([cx, cy]), axis=1)
+                radius = float(np.median(point_radii))
+                residual = float(np.median(np.abs(point_radii - radius)))
+            if (residual > config.max_radial_residual_px or
+                    any(math.hypot(cx - member.cx, cy - member.cy) > config.merge_center_tolerance_px or
+                        abs(radius - member.radius) > config.merge_radius_tolerance_px
+                        for member in joint_members)):
+                index += 1
+                continue
+            proposals = [proposal for proposal in reverify(cx, cy, radius)
+                         if all(compatible(proposal, member) and
+                                _spatial_arc_overlap(member, proposal, spatial_tolerance) >= 0.9
+                                for member in joint_members)]
+            if not proposals:
+                index += 1
+                continue
+            current = max(proposals, key=lambda value: (value.arc_span_deg * value.coverage, value.score))
+            members = joint_members
+            current.diagnostics.update(merged_arc_count=len(members),
+                                       merge_fit_residual_px=residual,
+                                       merge_center_tolerance_px=config.merge_center_tolerance_px,
+                                       merge_radius_tolerance_px=config.merge_radius_tolerance_px)
+            groups.pop(index)
+            merge_count += 1
+            index = 0
+        groups.append((current, members))
+    return [hit for hit, _ in groups], merge_count
 
 
 def detect_circle_scratches(image: np.ndarray, config: RuleConfig | None = None) -> RuleResult:
@@ -536,7 +709,13 @@ def detect_circle_scratches(image: np.ndarray, config: RuleConfig | None = None)
                                   "angle_convention": "0 degrees right; positive clockwise in image coordinates",
                                   "min_arc_deg": config.min_arc_deg, "edge_margin_px": config.edge_margin_px,
                                   "max_center_offset_px": config.max_center_offset_px,
-                                  "min_radius_px": config.min_radius_px, "max_radius_px": maximum_radius}
+                                  "min_radius_px": config.min_radius_px, "max_radius_px": maximum_radius,
+                                  "min_gray_difference": config.min_gray_difference,
+                                  "gray_background_offset_px": max(config.gray_background_offset_px,
+                                                                    config.radial_tolerance_px + 1.0),
+                                  "gray_background_width_px": config.gray_background_width_px,
+                                  "merge_center_tolerance_px": config.merge_center_tolerance_px,
+                                  "merge_radius_tolerance_px": config.merge_radius_tolerance_px}
     response = np.zeros_like(gray)
     for size in config.top_hat_sizes:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
@@ -626,18 +805,31 @@ def detect_circle_scratches(image: np.ndarray, config: RuleConfig | None = None)
     for cx, cy, radius, source in candidates:
         all_hits.extend(_verify_candidate(response, mask, wafer, (cx, cy, radius), config,
                                           float(threshold), maximum_radius, cosines, sines,
-                                          angular_step, source, tensors))
-    # Keep separated arcs and radii, remove only overlapping geometric duplicates.
+                                          angular_step, source, tensors, gray))
+    def reverify(cx: float, cy: float, radius: float) -> list[CircleHit]:
+        return _verify_candidate(response, mask, wafer, (cx, cy, radius), config,
+                                 float(threshold), maximum_radius, cosines, sines,
+                                 angular_step, "merged_arc_fit", tensors, gray)
+
+    ordered_hits = sorted(all_hits, key=lambda value: (value.arc_span_deg >= 350, value.score,
+                                                       value.arc_span_deg * value.coverage), reverse=True)
+    merged_hits, merge_count = _merge_overlapping_hits(ordered_hits, config, reverify)
+    # Keep separated arcs and radii, remove only overlapping geometric duplicates
+    # after unions have been independently checked against the image.
     kept: list[CircleHit] = []
     duplicate_count = 0
-    # Full rings have well-constrained geometry. For partial arcs, local evidence
-    # quality must outrank angular span: a wrongly smaller radius inflates span.
-    for hit in sorted(all_hits, key=lambda value: (value.arc_span_deg >= 350, value.score,
-                                                  value.arc_span_deg * value.coverage), reverse=True):
-        duplicate = any(math.hypot(hit.cx - old.cx, hit.cy - old.cy) <= max(4.0, config.radial_tolerance_px * 2) and
-                        abs(hit.radius - old.radius) <= max(3.0, config.radial_tolerance_px * 1.5) and
-                        _angle_overlap(hit, old) >= 0.5 or
-                        _spatial_arc_overlap(hit, old, max(3.0, config.radial_tolerance_px * 1.5)) >= 0.8
+    # Verified unions must explain their shorter constituent fits first. For
+    # unmerged partial arcs, prefer evidence quality over an inflated fitted span.
+    def rank(value: CircleHit) -> tuple[bool, bool, float, float, float]:
+        merged = value.diagnostics.get("merged_arc_count", 0) > 1
+        support = value.arc_span_deg * value.coverage
+        return value.arc_span_deg >= 350, merged, support if merged else 0.0, value.score, support
+
+    duplicate_tolerance = max(3.0, config.radial_tolerance_px * 1.5)
+    for hit in sorted(merged_hits, key=rank, reverse=True):
+        duplicate = any(_arc_is_contained(hit, old, max(config.max_gap_deg, angular_step)) and
+                        (_spatial_arc_overlap(hit, old, duplicate_tolerance) >= 0.8 or
+                         _evidence_arc_overlap(hit, old, duplicate_tolerance) >= 0.98)
                         for old in kept)
         if not duplicate:
             kept.append(hit)
@@ -647,6 +839,7 @@ def detect_circle_scratches(image: np.ndarray, config: RuleConfig | None = None)
             break
     diagnostics.update(hit_count=len(kept), elapsed_seconds=time.perf_counter() - started,
                        raw_hit_count=len(all_hits), duplicate_hit_count=duplicate_count,
+                       merged_arc_count=merge_count,
                        hit_limit_reached=len(kept) >= config.max_hits,
                        candidate_limit_reached=len(selected) >= config.max_grid_candidates)
     return RuleResult(wafer, kept, diagnostics, response)

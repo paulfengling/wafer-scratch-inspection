@@ -170,7 +170,7 @@ Windows 示例使用 `--workers 0` 避免 DataLoader 子进程问题。CPU 可�
 
 默认命中 circle 的图片直接跳过 YOLO，符合“先规则、后模型”的报废筛选流程。因此同一图的 line scratch 可能不单独记录。若需要完整分类统计，增加 `--yolo-on-rule-hit`。
 
-规则检测自动定位 wafer，结合亮细纹增强、候选圆拟合、圆心局部搜索、极坐标角度／半径支持和几何复核，区分弧、直线、散点与 wafer 边缘。`rule_config.json` 的主要参数：
+规则检测自动定位 wafer，结合亮细纹增强、原图局部灰阶差、候选圆拟合、圆心局部搜索、极坐标角度／半径支持和几何复核，区分弧、直线、散点与 wafer 边缘。圆心和半径接近的重叠圆弧会尝试插补合并，再验证共同圆的图像证据。`rule_config.json` 的主要参数：
 
 | 参数 | 默认 | 调整依据 |
 | --- | --- | --- |
@@ -179,9 +179,24 @@ Windows 示例使用 `--workers 0` 避免 DataLoader 子进程问题。CPU 可�
 | angular_step_deg | 0.5 | 极坐标角分辨率 |
 | radial_tolerance_px | 2.5 | 支持点半径容差 |
 | max_radial_residual_px | 2 | 拟合残差上限 |
-| max_gap_deg | 2 | 可容忍的内部小断裂 |
-| min_arc_coverage | 0.72 | 候选圆弧上的有效支持比例 |
+| max_gap_deg | 2 | 可插补的内部小断裂；插补角度不计为真实支持 |
+| min_arc_coverage | 0.72 | 候选圆弧上的真实有效支持比例，合并后仍须达标 |
 | edge_margin_px | 8 | 边缘排除宽度，需检查靠近 wafer 边缘的真实划痕 |
+| min_gray_difference | 25 | 原始 8-bit 灰阶中刮痕亮度减局部 wafer 亮度的最小差值；设为 0 关闭额外灰阶筛选 |
+| gray_background_offset_px | 6 | 背景采样带距刮痕 ridge 的径向偏移；实际至少为 `radial_tolerance_px + 1` |
+| gray_background_width_px | 3 | ridge 两侧径向背景采样带的宽度 |
+| merge_center_tolerance_px | 8 | 同组原始圆弧两两圆心距离的合并上限，单位 px |
+| merge_radius_tolerance_px | 5 | 同组原始圆弧两两半径差的合并上限，单位 px |
+| min_contrast | 6 | 未指定 `brightness_threshold` 时，top-hat 增强响应的自动阈值下限 |
+| brightness_threshold | null | 可指定固定 top-hat 增强响应阈值；null 使用基于中位数／MAD 的自动阈值 |
+
+灰阶差直接从原图计算：沿候选圆弧取刮痕 ridge 的灰阶，沿同一径向在 ridge 两侧采样 wafer 背景，并取有效背景样本的中位数。背景样本必须在 wafer 有效区域内，每个角度至少需要一侧采样带数量的有效样本。一个角度同时达到 top-hat 增强响应阈值和 `min_gray_difference` 才能计入支持。`brightness_threshold`／`min_contrast` 控制增强图上的亮纹筛选，`min_gray_difference` 控制原图中刮痕与局部 wafer 的亮度差，两者分别检查。默认差值 25 是调参起点，需用真实轻微划痕和应报废划痕样本确定；当前输入须为 uint8，范围 0–255。
+
+合并要求圆弧重叠或仅有 `max_gap_deg` 允许的小间隙，同时组内所有原始成员两两满足圆心与半径容差，因此圆心接近但半径差较大的同心划痕仍分别保存。合并时汇集真实支持点拟合共同圆，再按原图重新检查角度、coverage、支持长度、径向残差、圆弧相对直线的拟合收益、切向一致性和灰阶差；重新验证失败时保留原来的有效圆弧。跨 0° 的圆弧按环状角度处理，内部插补仍不增加真实 coverage。
+
+每个命中的 diagnostics 包含 `median_scratch_gray`、`median_wafer_gray`、`median_gray_difference` 与 `min_gray_difference`，可用来检查实测反差和当前门槛。规则结果的 diagnostics 提供 `merged_arc_count`（成功合并次数）和两个合并容差，便于确认合并行为。
+
+这些门槛只影响 rule-based 检测。规则未命中的图片仍会进入 YOLO 二次检测（无权重则进入 pending），所以提高灰阶差门槛不会在整个级联流程中全局屏蔽轻微划痕。
 
 偏移较大、短且曲率很小的圆弧、极弱反差或复杂纹理可能仍漏检，交由 YOLO 兜底。规则分数是几何评分而非概率。圆心搜索、边缘排除与亮纹阈值需通过真实样本检查后确定，不要只凭合成结果放行。
 

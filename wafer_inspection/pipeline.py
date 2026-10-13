@@ -171,6 +171,7 @@ def discover_images(source: Path, output: Path) -> list[Path]:
     """Exclude an output tree inside source, including resolved symlink paths."""
     if source.is_file():
         return [source]
+    output = output.resolve()
     return sorted(
         (p for p in source.rglob("*")
          if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
